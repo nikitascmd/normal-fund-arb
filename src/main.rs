@@ -1,99 +1,50 @@
-use reqwest;
-use serde::Deserialize;
+mod aster;
+mod common;
+mod hyperliquid;
+mod telegram_bot;
 
-#[derive(Deserialize, Debug)]
-struct FundingRate {
-    symbol: String,
-    #[serde(rename = "markPrice")]
-    mark_price: String,
-    #[serde(rename = "indexPrice")]
-    index_price: String,
-    #[serde(rename = "lastFundingRate")]
-    last_funding_rate: String,
-    #[serde(rename = "nextFundingTime")]
-    next_funding_time: i64,
-    time: i64,
-}
+use std::clone;
+
+use dotenv::dotenv;
+
+use crate::common::{FundingRate, FundingRateProvider};
+
+use tokio::time::{Duration, interval};
 
 #[tokio::main]
 async fn main() {
-    println!("Getting funding rates from Aster...");
+    dotenv().ok();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
 
-    let response = client
-        .get("https://fapi.asterdex.com/fapi/v1/premiumIndex")
-        .send()
-        .await;
+    let aster_api = aster::AsterApi::new(client.clone());
+    let hyperliquid_api = hyperliquid::HyperliquidApi::new(client.clone());
+    let telegram_bot = telegram_bot::TelegramBot::new(client.clone());
 
-    match response {
-        Ok(resp) => {
-            println!("Status: {}", resp.status());
+    let mut interval = interval(Duration::from_secs(60 * 5));
 
-            // Get response text first to see what we actually got
-            let text = resp.text().await.unwrap();
-            println!("Raw response: {}", text);
+    loop {
+        interval.tick().await;
 
-            // Try to parse as array of funding rates
-            match serde_json::from_str::<Vec<FundingRate>>(&text) {
-                Ok(mut funding_rates) => {
-                    println!("\n📊 Found {} funding rates:", funding_rates.len());
+        let aster_rates = aster_api.get_funding_rates().await.unwrap();
+        let hyper_rates = hyperliquid_api.get_funding_rates().await.unwrap();
 
-                    // Sort by funding rate (highest first)
-                    funding_rates.sort_by(|a, b| {
-                        let rate_a = a.last_funding_rate.parse::<f64>().unwrap_or(0.0);
-                        let rate_b = b.last_funding_rate.parse::<f64>().unwrap_or(0.0);
-                        rate_b
-                            .partial_cmp(&rate_a)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
+        let mut rates: Vec<FundingRate> = aster_rates.into_iter().chain(hyper_rates).collect();
+        rates.sort_by(|a, b| {
+            a.funding_rate_pct_eight_hours
+                .partial_cmp(&b.funding_rate_pct_eight_hours)
+                .unwrap()
+        });
 
-                    println!("\n🔥 Top funding rates (best arbitrage opportunities):");
-                    for rate in funding_rates.iter().take(10) {
-                        let funding_pct =
-                            rate.last_funding_rate.parse::<f64>().unwrap_or(0.0) * 100.0;
+        let smallest_rates: Vec<&FundingRate> = rates.iter().take(15).collect();
+        let largest_rates: Vec<&FundingRate> = rates.iter().rev().take(15).collect();
 
-                        println!("  {} - Funding: {:.4}%", rate.symbol, funding_pct);
-                    }
-
-                    println!("\n❄️  Lowest funding rates (shorts get paid):");
-                    for rate in funding_rates.iter().rev().take(5) {
-                        let funding_pct =
-                            rate.last_funding_rate.parse::<f64>().unwrap_or(0.0) * 100.0;
-
-                        println!("  {} - Funding: {:.4}%", rate.symbol, funding_pct);
-                    }
-                }
-                Err(e) => {
-                    println!("JSON parse error: {}", e);
-
-                    // Maybe it's a single object instead of array?
-                    match serde_json::from_str::<FundingRate>(&text) {
-                        Ok(single_rate) => {
-                            println!("Got single funding rate for: {}", single_rate.symbol);
-                        }
-                        Err(e2) => println!("Also failed as single object: {}", e2),
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            println!("Connection error: {}", e);
-            println!("Error details: {:?}", e);
-
-            // Try a simple ping first
-            println!("\nTrying ping endpoint instead...");
-            let ping_response = client
-                .get("https://fapi.asterdex.com/fapi/v1/ping")
-                .send()
-                .await;
-            match ping_response {
-                Ok(resp) => println!("Ping successful! Status: {}", resp.status()),
-                Err(e) => println!("Ping also failed: {}", e),
-            }
-        }
+        telegram_bot
+            .send_message(largest_rates, smallest_rates)
+            .await
+            .unwrap();
     }
 }
